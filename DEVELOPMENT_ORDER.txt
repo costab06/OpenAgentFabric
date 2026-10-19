@@ -1,0 +1,11 @@
+1. README and architecture docs
+2. Shared message contracts
+3. Docker Compose skeleton
+4. Mock A2A agent-to-agent calls
+5. SEC watcher
+6. SEC fetcher
+7. Parser/chunker
+8. Vector DB and retrieval
+9. Local Qwen synthesis
+10. Governance/policy enforcement demo
+

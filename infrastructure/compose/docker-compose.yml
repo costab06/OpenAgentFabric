@@ -1,0 +1,13 @@
+
+services:
+  redis:
+    image: redis:7
+    container_name: rag-sec-redis
+    ports:
+      - "6380:6379"
+    volumes:
+      - rag-sec-redis-data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+
+volumes:
+  rag-sec-redis-data:

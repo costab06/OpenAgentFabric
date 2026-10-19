@@ -1,0 +1,9 @@
+shared/
+    contracts/
+    config/
+    logging/
+    models/
+    security/
+    storage/
+    telemetry/
+

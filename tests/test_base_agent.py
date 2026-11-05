@@ -1,5 +1,6 @@
 
 from unittest.mock import AsyncMock
+from workflow_test_support import mocked_steps
 from uuid import uuid4
 
 import pytest
@@ -16,6 +17,10 @@ from shared.models import AgentName, ArtifactRef, ArtifactType
 
 
 class MockFetcherAgent(BaseAgent):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        mocked_steps(self)
+
     async def handle_event(self, event):
         return [
             DocumentFetchedEvent(

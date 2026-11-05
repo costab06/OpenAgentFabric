@@ -1,6 +1,10 @@
 
 from collections.abc import AsyncIterator, Sequence
 from uuid import UUID
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from shared.workflow.registry import StepCommit
 
 from redis.asyncio import Redis
 from redis.exceptions import ResponseError
@@ -16,6 +20,8 @@ ATOMIC_COMMIT_SCRIPT = """
 local stream = KEYS[1]
 local terminal_key = KEYS[2]
 local attempt_key = KEYS[3]
+local step_key = KEYS[4]
+local completion_key = KEYS[5]
 
 local group = ARGV[1]
 local message_id = ARGV[2]
@@ -26,6 +32,13 @@ local event_count = tonumber(ARGV[5])
 -- Downstream events occupy ARGV[6] through ARGV[5 + event_count].
 -- The optional consumer follows the downstream events.
 local expected_consumer = ARGV[6 + event_count] or ''
+local step_token = ARGV[7 + event_count] or ''
+local step_fingerprint = ARGV[8 + event_count] or ''
+local step_result = ARGV[9 + event_count] or ''
+local step_enabled = step_key ~= ''
+local completion_type = ARGV[10 + event_count] or ''
+local completion_json = nil
+
 
 -- Enforce mutually exclusive terminal states.
 local terminal_state = redis.call('GET', terminal_key)
@@ -105,6 +118,69 @@ for i = 1, event_count do
     end
 end
 
+-- Optionally select exactly one downstream completion event for indexing.
+-- Validate before any writes; the index and stream append share one Lua execution.
+if completion_key ~= '' then
+    if completion_type == '' then
+        return redis.error_reply('OAF_COMPLETION_TYPE_MISSING')
+    end
+    for i = 1, event_count do
+        local payload = ARGV[5 + i]
+        local downstream = cjson.decode(payload)
+        if downstream.event_type == completion_type then
+            if completion_json then
+                return redis.error_reply('OAF_MULTIPLE_COMPLETION_EVENTS')
+            end
+            completion_json = payload
+        end
+    end
+    if not completion_json then
+        return redis.error_reply('OAF_COMPLETION_EVENT_MISSING')
+    end
+    local existing = redis.call('GET', completion_key)
+    if existing and existing ~= completion_json then
+        return redis.error_reply('OAF_COMPLETION_CONFLICT')
+    end
+end
+
+-- Check the step fence BEFORE any writes. The same Lua invocation
+-- finalizes the step and commits downstream events.
+if step_enabled then
+    if step_fingerprint == '' or step_result == '' then
+        return redis.error_reply('OAF_STEP_ARGUMENTS_MISSING')
+    end
+    if redis.call('HGET', step_key, 'fingerprint') ~= step_fingerprint then
+        return redis.error_reply('OAF_STEP_FINGERPRINT_MISMATCH')
+    end
+    if redis.call('HGET', step_key, 'status') == 'completed' then
+        -- Replay of an already completed logical step: acknowledge this
+        -- source delivery without emitting downstream events again.
+        if event_count ~= 0 then
+            return redis.error_reply('OAF_COMPLETED_STEP_REQUIRES_EMPTY_OUTPUT')
+        end
+        redis.call('XACK', stream, group, message_id)
+        redis.call('SET', terminal_key, 'committed')
+        redis.call('DEL', attempt_key)
+        return 0
+    end
+    if redis.call('HGET', step_key, 'status') ~= 'running'
+       or redis.call('HGET', step_key, 'token') ~= step_token then
+        return redis.error_reply('OAF_STEP_OWNERSHIP_LOST')
+    end
+    -- Step lease expiry is checked against Redis time. A lease must
+    -- be renewed by the worker during long-running operations.
+    local time = redis.call('TIME')
+    local now_ms = tonumber(time[1]) * 1000 + math.floor(tonumber(time[2]) / 1000)
+    local lease_until = tonumber(redis.call('HGET', step_key, 'lease_until') or '0')
+    if lease_until <= now_ms then
+        return redis.error_reply('OAF_STEP_LEASE_EXPIRED')
+    end
+    local valid_result = pcall(cjson.decode, step_result)
+    if not valid_result then
+        return redis.error_reply('OAF_INVALID_STEP_RESULT')
+    end
+end
+
 -- Publish downstream events.
 for i = 1, event_count do
     redis.call(
@@ -112,9 +188,19 @@ for i = 1, event_count do
     )
 end
 
+-- The completion index is written atomically with event publication.
+if completion_json then
+    redis.call('SET', completion_key, completion_json)
+end
+
 -- Acknowledge the source event.
 redis.call('XACK', stream, group, message_id)
-redis.call('SET', terminal_key, 'committed', 'EX', ttl_seconds)
+if step_enabled then
+    redis.call('HSET', step_key, 'status', 'completed', 'result', step_result)
+    redis.call('HDEL', step_key, 'lease_until', 'token')
+end
+-- Workflow terminal markers must survive indefinite replay.
+redis.call('SET', terminal_key, 'committed')
 redis.call('DEL', attempt_key)
 return 1
 """
@@ -463,7 +549,9 @@ class RedisEventBus(EventBus):
             message_id: str,
             source_event_id: UUID,
             downstream_events: Sequence[EventEnvelope],
+            step_commit: "StepCommit",
             consumer: str | None = None,
+            completion_event_type: str | None = None,
     ) -> bool:
         """
         Validate and atomically commit an event-processing result.
@@ -482,12 +570,24 @@ class RedisEventBus(EventBus):
             for event in downstream_events
         ]
 
+        from shared.workflow.registry import StepRegistry
+        step_key = StepRegistry.key(step_commit.correlation_id, step_commit.agent, step_commit.step)
+        step_result = step_commit.encoded_result()
+
+        if completion_event_type is not None and not completion_event_type:
+            raise ValueError("completion_event_type must be nonempty")
+        completion_key = (
+            f"oaf:workflow:completion:{step_commit.correlation_id}:{completion_event_type}"
+            if completion_event_type is not None else ""
+        )
         result = await self.redis.eval(
             ATOMIC_COMMIT_SCRIPT,
-            3,
+            5,
             stream,
             terminal_key,
             self._attempt_key(stream, group, message_id),
+            step_key,
+            completion_key,
             group,
             message_id,
             str(source_event_id),
@@ -495,29 +595,14 @@ class RedisEventBus(EventBus):
             len(serialized_events),
             *serialized_events,
             consumer or "",
+            step_commit.token,
+            step_commit.fingerprint,
+            step_result,
+            completion_event_type or "",
         )
 
         return bool(result)
 
-
-        serialized_events = [
-            event.model_dump_json()
-            for event in downstream_events
-        ]
-
-        result = await self.redis.eval(
-            ATOMIC_COMMIT_SCRIPT,
-            2,
-            stream,
-            completion_key,
-            group,
-            message_id,
-            self.DEFAULT_COMMIT_TTL,
-            len(serialized_events),
-            *serialized_events,
-        )
-
-        return bool(result)
 
     async def dead_letter(
             self,

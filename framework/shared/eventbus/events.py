@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
@@ -44,6 +44,7 @@ class DocumentFetchedPayload(BaseModel):
     accession_number: str
     company_name: str
     filing_type: str
+    filing_date: str | None = None
     artifact: ArtifactRef
 
 
@@ -60,8 +61,8 @@ class ChunksCreatedPayload(BaseModel):
 
 class EventEnvelope(BaseModel):
     event_id: UUID = Field(default_factory=uuid4)
-    event_type: EventType
-    source_agent: AgentName
+    event_type: EventType | str
+    source_agent: AgentName | str
 
     correlation_id: UUID = Field(default_factory=uuid4)
     causation_id: UUID | None = None
@@ -74,6 +75,7 @@ class EventEnvelope(BaseModel):
         | DocumentFetchedPayload
         | DocumentParsedPayload
         | ChunksCreatedPayload
+        | dict[str, Any]
     )
 
 

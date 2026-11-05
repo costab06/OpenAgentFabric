@@ -1,3 +1,4 @@
+from workflow_test_support import claimed_step
 
 from uuid import uuid4
 
@@ -66,6 +67,8 @@ async def test_wrong_consumer_cannot_commit():
             bus, stream, group, event
         )
 
+        step_commit = await claimed_step(bus, event)
+
         # Consumer B must not commit consumer A's message.
         with pytest.raises(
             ResponseError,
@@ -78,7 +81,7 @@ async def test_wrong_consumer_cannot_commit():
                 source_event_id=event.event_id,
                 downstream_events=[],
                 consumer="consumer-b",
-            )
+            step_commit=step_commit)
 
         # Failed commit must not acknowledge the message.
         pending = await bus.get_pending_message(
@@ -97,7 +100,7 @@ async def test_wrong_consumer_cannot_commit():
             source_event_id=event.event_id,
             downstream_events=[],
             consumer="consumer-a",
-        )
+        step_commit=step_commit)
 
         assert committed is True
         assert await bus.redis.get(terminal_key) == "committed"
@@ -221,6 +224,8 @@ async def test_reclaimed_message_rejects_previous_owner():
         assert pending.consumer == "consumer-b"
         assert pending.delivery_count == 2
 
+        step_commit = await claimed_step(bus, event)
+
         # The previous owner must be rejected.
         with pytest.raises(
             ResponseError,
@@ -233,7 +238,7 @@ async def test_reclaimed_message_rejects_previous_owner():
                 source_event_id=event.event_id,
                 downstream_events=[],
                 consumer="consumer-a",
-            )
+            step_commit=step_commit)
 
         # The new owner can commit.
         committed = await bus.commit(
@@ -243,7 +248,7 @@ async def test_reclaimed_message_rejects_previous_owner():
             source_event_id=event.event_id,
             downstream_events=[],
             consumer="consumer-b",
-        )
+        step_commit=step_commit)
 
         assert committed is True
         assert await bus.redis.get(terminal_key) == "committed"

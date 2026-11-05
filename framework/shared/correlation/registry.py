@@ -87,7 +87,6 @@ class CorrelationRegistry:
         await self.redis.set(
             self._key(correlation_id),
             record.model_dump_json(),
-            ex=self.ttl_seconds,
             nx=True,
         )
 
@@ -112,13 +111,7 @@ class CorrelationRegistry:
         return CorrelationRecord.model_validate_json(value)
 
     async def refresh(self, correlation_id: UUID) -> bool:
-        return bool(
-            await self.redis.expire(
-                self._key(correlation_id),
-                self.ttl_seconds,
-                xx=True,
-            )
-        )
+        return bool(await self.redis.exists(self._key(correlation_id)))
 
     async def exists(self, correlation_id: UUID) -> bool:
         return bool(

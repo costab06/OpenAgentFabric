@@ -1,3 +1,4 @@
+from workflow_test_support import claimed_step
 
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
@@ -350,7 +351,7 @@ async def test_success_on_fifth_attempt_commits():
             source_event_id=event.event_id,
             downstream_events=[],
             consumer=agent.consumer,
-        )
+        step_commit=await claimed_step(bus, event))
 
         assert result is False
 

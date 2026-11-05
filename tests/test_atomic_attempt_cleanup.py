@@ -1,3 +1,4 @@
+from workflow_test_support import claimed_step
 
 from uuid import uuid4
 
@@ -75,7 +76,7 @@ async def test_commit_atomically_clears_attempts():
             source_event_id=event.event_id,
             downstream_events=[],
             consumer=consumer,
-        )
+        step_commit=await claimed_step(bus, event))
 
         assert result is True
 
@@ -183,7 +184,7 @@ async def test_failed_commit_preserves_attempts():
                 source_event_id=uuid4(),
                 downstream_events=[],
                 consumer=consumer,
-            )
+            step_commit=await claimed_step(bus, event))
 
         assert await bus.get_attempt_count(
             stream, group, message_id

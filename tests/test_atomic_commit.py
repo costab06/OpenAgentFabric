@@ -1,3 +1,4 @@
+from workflow_test_support import claimed_step
 from uuid import uuid4
 
 import pytest
@@ -78,7 +79,7 @@ async def test_atomic_commit_publishes_and_acknowledges():
             message_id=message_id,
             source_event_id=source.event_id,
             downstream_events=[downstream],
-        )
+        step_commit=await claimed_step(bus, source))
 
         assert committed is True
 
@@ -120,12 +121,17 @@ async def test_atomic_commit_does_not_duplicate_events():
         ):
             break
 
+        # A duplicate commit uses the same fenced claim; a completed step
+        # must never be claimed a second time.
+        step_commit = await claimed_step(bus, source)
         first = await bus.commit(
-            stream, group, message_id, source.event_id, [downstream]
+            stream, group, message_id, source.event_id, [downstream],
+            step_commit=step_commit,
         )
 
         second = await bus.commit(
-            stream, group, message_id, source.event_id, [downstream]
+            stream, group, message_id, source.event_id, [downstream],
+            step_commit=step_commit,
         )
 
         assert first is True

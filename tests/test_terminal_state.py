@@ -1,3 +1,4 @@
+from workflow_test_support import claimed_step
 
 from uuid import uuid4
 
@@ -69,7 +70,7 @@ async def test_commit_prevents_subsequent_dead_letter():
             message_id=message_id,
             source_event_id=event.event_id,
             downstream_events=[],
-        )
+        step_commit=await claimed_step(bus, event))
 
         assert committed is True
         assert await bus.redis.get(terminal_key) == "committed"
@@ -138,7 +139,7 @@ async def test_dead_letter_prevents_subsequent_commit():
                 message_id=message_id,
                 source_event_id=event.event_id,
                 downstream_events=[],
-            )
+            step_commit=await claimed_step(bus, event))
 
         assert await bus.redis.xlen(stream) == 1
         assert await bus.redis.xlen(dlq_stream) == 1
@@ -181,12 +182,17 @@ async def test_terminal_state_is_group_specific():
 
         assert messages
 
+        # Terminal states are consumer-group scoped. Each group also needs
+        # its own step identity, so both may process the same source event.
+        step_a = await claimed_step(bus, event, agent="terminal-group-a")
+        step_b = await claimed_step(bus, event, agent="terminal-group-b")
         assert await bus.commit(
-            stream, group_a, message_id, event.event_id, []
+            stream, group_a, message_id, event.event_id, [],
+            step_commit=step_a,
         )
-
         assert await bus.commit(
-            stream, group_b, message_id, event.event_id, []
+            stream, group_b, message_id, event.event_id, [],
+            step_commit=step_b,
         )
 
         assert await bus.redis.get(key_a) == "committed"

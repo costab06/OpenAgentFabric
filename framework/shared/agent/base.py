@@ -1,6 +1,7 @@
 
 import asyncio
 import logging
+import hashlib
 
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
@@ -10,6 +11,7 @@ from shared.correlation.registry import CorrelationRegistry
 from shared.eventbus.base import EventBus
 from shared.eventbus.events import EventEnvelope, EventType
 from shared.models import AgentName
+from shared.workflow.registry import StepRegistry, StepCommit, StepConflict
 
 
 logger = logging.getLogger(__name__)
@@ -30,7 +32,7 @@ class BaseAgent(ABC):
 
     def __init__(
         self,
-        name: AgentName,
+        name: AgentName | str,
         event_bus: EventBus,
         correlation_registry: CorrelationRegistry,
         subscribed_event_types: set[EventType],
@@ -42,6 +44,7 @@ class BaseAgent(ABC):
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         dlq_stream: str = DEFAULT_DLQ_STREAM,
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
+        completion_event_type: str | None = None,
     ):
         if recovery_interval <= 0:
             raise ValueError("recovery_interval must be positive")
@@ -70,10 +73,11 @@ class BaseAgent(ABC):
         self.event_bus = event_bus
         self.correlation_registry = correlation_registry
         self.subscribed_event_types = subscribed_event_types
+        self.completion_event_type = completion_event_type
 
         self.stream = stream
-        self.group = f"oaf.agent.{name.value}"
-        self.consumer = consumer or f"{name.value}-{uuid4().hex}"
+        self.group = f"oaf.agent.{name}"
+        self.consumer = consumer or f"{name}-{uuid4().hex}"
 
         self.recovery_interval = recovery_interval
         self.min_idle_ms = min_idle_ms
@@ -84,6 +88,8 @@ class BaseAgent(ABC):
 
         self._running = False
         self._processing_lock = asyncio.Lock()
+        self.step_registry = StepRegistry(event_bus.redis)
+        self.step_lease_ms = max(30000, int(heartbeat_interval * 4000))
 
     @abstractmethod
     async def handle_event(
@@ -108,7 +114,7 @@ class BaseAgent(ABC):
                     "Downstream causation_id does not match source"
                 )
 
-            if downstream.source_agent != self.name:
+            if str(downstream.source_agent) != str(self.name):
                 raise ValueError(
                     "Downstream source_agent does not match agent"
                 )
@@ -271,7 +277,7 @@ class BaseAgent(ABC):
             source_event_id=event.event_id,
             error=error,
             attempts=attempts,
-            agent=self.name.value,
+            agent=str(self.name),
             dlq_stream=self.dlq_stream,
             consumer=self.consumer,
         )
@@ -283,6 +289,27 @@ class BaseAgent(ABC):
                 attempts,
                 error,
             )
+
+    async def _renew_step(self, event, step, fingerprint, token, processing_task, terminal_phase):
+        while True:
+            await asyncio.sleep(self.heartbeat_interval)
+            if terminal_phase.is_set():
+                return
+            try:
+                ok = await self.step_registry.renew(
+                    event.correlation_id, str(self.name), step,
+                    fingerprint, token, lease_ms=self.step_lease_ms,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Step lease renewal failed for %s", event.event_id)
+                processing_task.cancel()
+                return
+            if not ok:
+                logger.error("Step ownership lost for %s", event.event_id)
+                processing_task.cancel()
+                return
 
     async def process_message(
         self,
@@ -325,6 +352,34 @@ class BaseAgent(ABC):
                 consumer=self.consumer,
             )
 
+            step = str(event.event_id)
+            fingerprint = hashlib.sha256(event.model_dump_json().encode("utf-8")).hexdigest()
+            claim = await self.step_registry.claim(
+                event.correlation_id, str(self.name), step,
+                fingerprint, lease_ms=self.step_lease_ms,
+            )
+            if claim.status == "busy":
+                # Leave pending for reclaim after the active lease expires.
+                return
+            if claim.status == "completed":
+                # A durable step record is only sufficient for replay when it
+                # identifies this source event and the eventbus terminal marker
+                # confirms the atomic publication/ACK transaction.
+                record = await self.step_registry.get(
+                    event.correlation_id, str(self.name), step,
+                )
+                result = (record or {}).get("result") or {}
+                terminal = await self.event_bus.get_terminal_state(
+                    self.stream, self.group, event.event_id,
+                )
+                if result.get("event_id") != str(event.event_id) or terminal != "committed":
+                    raise StepConflict(
+                        "Completed step lacks verified atomic event commit"
+                    )
+                # The original source has already been committed. Never invoke
+                # the handler or publish downstream events on replay.
+                return
+
             processing_task = asyncio.current_task()
             ownership_lost = asyncio.Event()
             heartbeat_failed = asyncio.Event()
@@ -338,9 +393,14 @@ class BaseAgent(ABC):
                     heartbeat_failed,
                     terminal_phase,
                 ),
-                name=f"{self.name.value}-heartbeat",
+                name=f"{self.name}-heartbeat",
             )
 
+            lease_task = asyncio.create_task(
+                self._renew_step(event, step, fingerprint, claim.token,
+                                 processing_task, terminal_phase),
+                name=f"{self.name}-step-lease",
+            )
             try:
                 try:
                     correlation = (
@@ -386,6 +446,16 @@ class BaseAgent(ABC):
                         self.max_attempts,
                     )
 
+                    # A failed handler must not retain its step lease. A
+                    # superseded worker cannot release a newer worker's claim.
+                    try:
+                        await self.step_registry.release(
+                            event.correlation_id, str(self.name), step,
+                            fingerprint, claim.token,
+                        )
+                    except Exception:
+                        logger.exception("Failed to release step claim for %s", event.event_id)
+
                     if attempts >= self.max_attempts:
                         await self._verify_ownership(message_id)
 
@@ -413,6 +483,16 @@ class BaseAgent(ABC):
                             source_event_id=event.event_id,
                             downstream_events=downstream_events,
                             consumer=self.consumer,
+                            completion_event_type=(
+                                self.completion_event_type
+                                if self.completion_event_type is not None and any(
+                                    item.event_type == self.completion_event_type
+                                    for item in downstream_events
+                                ) else None
+                            ),
+                            step_commit=StepCommit(
+                                event.correlation_id, str(self.name), step,
+                                fingerprint, claim.token, {"event_id": str(event.event_id)}),
                         ),
                         event.event_id,
                         "committed",
@@ -464,6 +544,11 @@ class BaseAgent(ABC):
                 )
 
             finally:
+                lease_task.cancel()
+                try:
+                    await lease_task
+                except asyncio.CancelledError:
+                    pass
                 heartbeat_task.cancel()
 
                 try:
@@ -527,7 +612,7 @@ class BaseAgent(ABC):
             except Exception:
                 logger.exception(
                     "Periodic recovery failed for agent %s",
-                    self.name.value,
+                    str(self.name),
                 )
 
     async def run(self) -> None:
@@ -539,7 +624,7 @@ class BaseAgent(ABC):
 
             recovery_task = asyncio.create_task(
                 self._recovery_loop(),
-                name=f"{self.name.value}-recovery",
+                name=f"{self.name}-recovery",
             )
 
             async for message_id, event in (

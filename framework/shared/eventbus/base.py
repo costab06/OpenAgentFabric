@@ -65,6 +65,7 @@ class EventBus(ABC):
             source_event_id: UUID,
             downstream_events: Sequence[EventEnvelope],
             consumer: str | None = None,
+            step_commit: "StepCommit" = None,
     ) -> bool:
         ...
         """

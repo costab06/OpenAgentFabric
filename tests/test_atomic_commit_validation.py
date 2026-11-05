@@ -1,3 +1,4 @@
+from workflow_test_support import claimed_step
 
 from uuid import uuid4
 
@@ -62,7 +63,7 @@ async def test_commit_rejects_nonexistent_message():
                 message_id="9999999999999-0",
                 source_event_id=event.event_id,
                 downstream_events=[],
-            )
+            step_commit=await claimed_step(bus, event))
 
         assert await bus.redis.xlen(stream) == 1
 
@@ -93,7 +94,7 @@ async def test_commit_rejects_event_id_mismatch():
                 message_id=message_id,
                 source_event_id=uuid4(),
                 downstream_events=[],
-            )
+            step_commit=await claimed_step(bus, event))
 
         assert await bus.redis.xlen(stream) == 1
 
@@ -129,7 +130,7 @@ async def test_commit_rejects_unclaimed_message():
                 message_id=message_id,
                 source_event_id=event.event_id,
                 downstream_events=[],
-            )
+            step_commit=await claimed_step(bus, event))
 
         assert await bus.redis.xlen(stream) == 1
 

@@ -1,0 +1,1 @@
+Migrates legacy commit tests to mandatory fenced StepCommit using real Redis claims. Unit-agent tests inject an explicit mocked StepRegistry. This patch is not a fully validated release; run the complete suite. No production interfaces are relaxed.

@@ -1,5 +1,6 @@
 
 from unittest.mock import AsyncMock
+from workflow_test_support import mocked_steps
 from uuid import uuid4
 
 import pytest
@@ -41,6 +42,7 @@ class RetryAgent(BaseAgent):
             max_attempts=5,
         )
 
+        mocked_steps(self)
         self.failures_remaining = failures
         self.handler_calls = 0
 

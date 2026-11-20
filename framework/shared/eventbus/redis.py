@@ -22,6 +22,7 @@ local terminal_key = KEYS[2]
 local attempt_key = KEYS[3]
 local step_key = KEYS[4]
 local completion_key = KEYS[5]
+local terminal_message_key = KEYS[6]
 
 local group = ARGV[1]
 local message_id = ARGV[2]
@@ -44,6 +45,10 @@ local completion_json = nil
 local terminal_state = redis.call('GET', terminal_key)
 
 if terminal_state == 'committed' then
+    local original_message = redis.call('GET', terminal_message_key)
+    if original_message and original_message ~= message_id then
+        return redis.error_reply('OAF_TERMINAL_MESSAGE_ID_MISMATCH')
+    end
     return 0
 end
 
@@ -160,6 +165,7 @@ if step_enabled then
         end
         redis.call('XACK', stream, group, message_id)
         redis.call('SET', terminal_key, 'committed')
+        redis.call('SET', terminal_message_key, message_id)
         redis.call('DEL', attempt_key)
         return 0
     end
@@ -201,6 +207,7 @@ if step_enabled then
 end
 -- Workflow terminal markers must survive indefinite replay.
 redis.call('SET', terminal_key, 'committed')
+redis.call('SET', terminal_message_key, message_id)
 redis.call('DEL', attempt_key)
 return 1
 """
@@ -212,6 +219,7 @@ local source_stream = KEYS[1]
 local dlq_stream = KEYS[2]
 local terminal_key = KEYS[3]
 local attempt_key = KEYS[4]
+local terminal_message_key = KEYS[5]
 
 local group = ARGV[1]
 local message_id = ARGV[2]
@@ -229,6 +237,10 @@ local expected_consumer = ARGV[9] or ''
 local terminal_state = redis.call('GET', terminal_key)
 
 if terminal_state == 'dead_lettered' then
+    local original_message = redis.call('GET', terminal_message_key)
+    if original_message and original_message ~= message_id then
+        return redis.error_reply('OAF_TERMINAL_MESSAGE_ID_MISMATCH')
+    end
     return 0
 end
 
@@ -301,6 +313,7 @@ redis.call(
 -- Acknowledge the original event.
 redis.call('XACK', source_stream, group, message_id)
 redis.call('SET', terminal_key, 'dead_lettered', 'EX', ttl_seconds)
+redis.call('SET', terminal_message_key, message_id, 'EX', ttl_seconds)
 redis.call('DEL', attempt_key)
 return 1
 """
@@ -375,6 +388,58 @@ if #claimed ~= 1 then
     return 0
 end
 
+return 1
+"""
+
+
+RECONCILE_TERMINAL_PENDING_SCRIPT = """
+local stream = KEYS[1]
+local terminal_key = KEYS[2]
+local attempt_key = KEYS[3]
+local terminal_message_key = KEYS[4]
+local group = ARGV[1]
+local message_id = ARGV[2]
+local expected_event_id = ARGV[3]
+local expected_consumer = ARGV[4]
+
+local terminal = redis.call('GET', terminal_key)
+if terminal ~= 'committed' and terminal ~= 'dead_lettered' then
+    return redis.error_reply('OAF_NOT_TERMINAL')
+end
+local terminal_message = redis.call('GET', terminal_message_key)
+if not terminal_message then
+    return redis.error_reply('OAF_TERMINAL_MESSAGE_ID_MISSING')
+end
+if terminal_message ~= message_id then
+    return redis.error_reply('OAF_TERMINAL_MESSAGE_ID_MISMATCH')
+end
+local pending = redis.call('XPENDING', stream, group, message_id, message_id, 1)
+if #pending ~= 1 then
+    return 0
+end
+if pending[1][2] ~= expected_consumer then
+    return redis.error_reply('OAF_CONSUMER_OWNERSHIP_MISMATCH')
+end
+local source = redis.call('XRANGE', stream, message_id, message_id)
+if #source ~= 1 then
+    return redis.error_reply('OAF_SOURCE_NOT_FOUND')
+end
+local serialized = nil
+for i = 1, #source[1][2], 2 do
+    if source[1][2][i] == 'event' then
+        serialized = source[1][2][i+1]
+        break
+    end
+end
+if not serialized then
+    return redis.error_reply('OAF_SOURCE_EVENT_MISSING')
+end
+local ok, event = pcall(cjson.decode, serialized)
+if not ok or type(event) ~= 'table' or event.event_id ~= expected_event_id then
+    return redis.error_reply('OAF_SOURCE_EVENT_ID_MISMATCH')
+end
+redis.call('XACK', stream, group, message_id)
+redis.call('DEL', attempt_key)
 return 1
 """
 
@@ -582,12 +647,13 @@ class RedisEventBus(EventBus):
         )
         result = await self.redis.eval(
             ATOMIC_COMMIT_SCRIPT,
-            5,
+            6,
             stream,
             terminal_key,
             self._attempt_key(stream, group, message_id),
             step_key,
             completion_key,
+            self._terminal_message_key(stream, group, source_event_id),
             group,
             message_id,
             str(source_event_id),
@@ -631,11 +697,12 @@ class RedisEventBus(EventBus):
 
         result = await self.redis.eval(
             ATOMIC_DEAD_LETTER_SCRIPT,
-            4,
+            5,
             stream,
             dlq_stream,
             terminal_key,
             self._attempt_key(stream, group, message_id),
+            self._terminal_message_key(stream, group, source_event_id),
             group,
             message_id,
             str(source_event_id),
@@ -782,6 +849,39 @@ class RedisEventBus(EventBus):
         Close the Redis connection pool.
         """
         await self.redis.aclose()
+
+    @staticmethod
+    def _terminal_message_key(stream: str, group: str, source_event_id) -> str:
+        return f"oaf:terminal-message:{stream}:{group}:{source_event_id}"
+
+    async def reconcile_terminal_pending(
+        self,
+        stream: str,
+        group: str,
+        message_id: str,
+        source_event_id,
+        consumer: str,
+    ) -> bool:
+        """ACK stale PEL entry only if terminal marker, owner, and event match.
+
+        This Lua operation is atomic; a stale worker cannot ACK a reclaimed
+        delivery. It never republishes an event or creates a DLQ entry.
+        """
+        if not consumer:
+            raise ValueError("consumer must not be empty")
+        result = await self.redis.eval(
+            RECONCILE_TERMINAL_PENDING_SCRIPT,
+            4,
+            stream,
+            f"oaf:terminal:{stream}:{group}:{source_event_id}",
+            self._attempt_key(stream, group, message_id),
+            self._terminal_message_key(stream, group, source_event_id),
+            group,
+            message_id,
+            str(source_event_id),
+            consumer,
+        )
+        return bool(result)
 
     async def get_terminal_state(
         self,

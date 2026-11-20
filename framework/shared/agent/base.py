@@ -328,6 +328,31 @@ class BaseAgent(ABC):
             # Check ownership before touching attempt state.
             await self._verify_ownership(message_id)
 
+            # Terminal state is keyed by event ID, so verify the durable step
+            # record before acknowledging any replayed Redis message.
+            terminal = await self.event_bus.get_terminal_state(
+                self.stream, self.group, event.event_id,
+            )
+            if terminal in ("committed", "dead_lettered"):
+                step = str(event.event_id)
+                record = await self.step_registry.get(
+                    event.correlation_id, str(self.name), step,
+                )
+                result = (record or {}).get("result") or {}
+                matches = result.get("event_id") == str(event.event_id)
+                if terminal == "committed" and not matches:
+                    raise StepConflict("Terminal commit lacks matching durable step record")
+                if terminal == "dead_lettered" and matches:
+                    raise StepConflict("Completed step conflicts with dead-lettered state")
+                await self.event_bus.reconcile_terminal_pending(
+                    stream=self.stream,
+                    group=self.group,
+                    message_id=message_id,
+                    source_event_id=event.event_id,
+                    consumer=self.consumer,
+                )
+                return
+
             existing_attempts = (
                 await self.event_bus.get_attempt_count(
                     self.stream,
@@ -376,8 +401,15 @@ class BaseAgent(ABC):
                     raise StepConflict(
                         "Completed step lacks verified atomic event commit"
                     )
-                # The original source has already been committed. Never invoke
-                # the handler or publish downstream events on replay.
+                # Reconcile a stale PEL entry without rerunning the handler.
+                # Redis atomically verifies ownership, identity, and marker.
+                await self.event_bus.reconcile_terminal_pending(
+                    stream=self.stream,
+                    group=self.group,
+                    message_id=message_id,
+                    source_event_id=event.event_id,
+                    consumer=self.consumer,
+                )
                 return
 
             processing_task = asyncio.current_task()

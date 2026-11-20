@@ -61,6 +61,7 @@ def dependencies():
     bus = AsyncMock()
     registry = AsyncMock()
 
+    bus.get_terminal_state.return_value = None
     bus.get_attempt_count.return_value = 0
     bus.begin_attempt.return_value = 1
     bus.commit.return_value = True
